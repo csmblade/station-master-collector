@@ -9,6 +9,7 @@
 
 services:
   collector:
+    build: .
     image: csmblade/station-master-collector:latest
     container_name: station_collector
     restart: unless-stopped
