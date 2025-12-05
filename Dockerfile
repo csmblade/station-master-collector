@@ -1,7 +1,7 @@
 # Station Master Collector - Standalone Docker Image
 # https://github.com/yourusername/station-master-collector
 
-FROM python:3.11-slim as base
+FROM python:3.11-slim AS base
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -18,19 +18,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Build stage
-FROM base as builder
+FROM base AS builder
 
 RUN pip install --upgrade pip build
 
 # Copy project files
 COPY collector/ ./collector/
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 
 # Install dependencies
 RUN pip install --target=/app/deps .
 
 # Production stage
-FROM base as production
+FROM base AS production
 
 # Copy installed packages
 COPY --from=builder /app/deps /app/deps
