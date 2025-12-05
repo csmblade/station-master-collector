@@ -1,0 +1,40 @@
+# Station Master Collector - Client Site Deployment
+# https://github.com/csmblade/station-master-collector
+#
+# Quick Start:
+# 1. Copy config.example.yaml to config.yaml
+# 2. Edit config.yaml with your station details
+# 3. Run: docker-compose up -d
+# 4. Check logs: docker-compose logs -f
+
+services:
+  collector:
+    image: csmblade/station-master-collector:latest
+    container_name: station_collector
+    restart: unless-stopped
+    volumes:
+      # Configuration file (required)
+      - ./config.yaml:/config/config.yaml:ro
+      # Persistent buffer for offline resilience
+      - collector_buffer:/app/buffer
+    ports:
+      # Syslog UDP (standard port - requires root/elevated privileges)
+      - "514:514/udp"
+      # Syslog TCP (non-privileged port)
+      - "1514:1514/tcp"
+      # SNMP Trap receiver (standard port - requires root/elevated privileges)
+      - "162:162/udp"
+    environment:
+      # Timezone for log timestamps
+      - TZ=${TZ:-UTC}
+    # Optional: Use host networking for easier syslog/trap reception
+    # network_mode: host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  collector_buffer:
+    driver: local
