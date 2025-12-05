@@ -26,6 +26,7 @@ class PluginManager:
         "omnia_mpx": "collector.plugins.omnia_mpx",
         "omnia_mpx_decoder": "collector.plugins.omnia_mpx_decoder",
         "omnia_9sg": "collector.plugins.omnia_9sg",
+        "omnia_volt": "collector.plugins.omnia_volt",
         "zetta": "collector.plugins.zetta",
     }
 
