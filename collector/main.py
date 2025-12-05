@@ -10,7 +10,9 @@ import typer
 
 from collector.core.config import CollectorConfig
 from collector.core.db_loader import DatabaseConfigLoader
+from collector.core.heartbeat import HeartbeatManager
 from collector.core.plugin_manager import PluginManager
+from collector.core.remote_logging import RemoteLogHandler
 from collector.core.scheduler import CollectionScheduler
 from collector.core.transport import SecureTransport
 from collector.core.syslog_server import SyslogServer, SyslogSource
@@ -34,6 +36,7 @@ class Collector:
     """Main collector application."""
 
     CONFIG_REFRESH_INTERVAL = 60  # seconds - check for new devices every minute
+    ROLE_CHECK_INTERVAL = 5  # seconds - check for role changes
 
     def __init__(self, config: CollectorConfig, use_database: bool = False) -> None:
         self.config = config
@@ -49,6 +52,13 @@ class Collector:
         self._active_plugins: dict[str, "PluginConfig"] = {}
         self._known_device_ids: set[str] = set()
         self._config_refresh_task: asyncio.Task | None = None
+        self._role_monitor_task: asyncio.Task | None = None
+
+        # Enterprise features
+        self.heartbeat_manager: HeartbeatManager | None = None
+        self.remote_log_handler: RemoteLogHandler | None = None
+        self._current_config_version: str | None = None
+        self._scheduler_running: bool = False
 
         # Syslog components
         self.syslog_server: SyslogServer | None = None
@@ -61,6 +71,10 @@ class Collector:
     def _on_metrics(self, metrics: list[MetricPoint]) -> None:
         """Callback when metrics are collected."""
         asyncio.create_task(self.transport.enqueue(metrics))
+
+        # Update heartbeat metrics counter
+        if self.heartbeat_manager:
+            self.heartbeat_manager.increment_metrics(len(metrics))
 
     def _on_syslog_message(
         self, message: SyslogMessage, source_ip: str, protocol: str
@@ -139,7 +153,7 @@ class Collector:
                 self._active_plugins[plugin_config.plugin_name] = plugin_config
 
     async def _refresh_config(self) -> None:
-        """Periodically check for new devices and add them to the scheduler."""
+        """Periodically check for device changes and update the scheduler."""
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.sleep(self.CONFIG_REFRESH_INTERVAL)
@@ -147,10 +161,38 @@ class Collector:
                 if not self.db_loader:
                     continue
 
+                # Check if heartbeat indicates config changed
+                if self.heartbeat_manager and not self.heartbeat_manager.config_changed:
+                    # Config hasn't changed, skip refresh
+                    continue
+
                 api_config = await self.db_loader.fetch_config()
                 plugin_configs = self.db_loader.build_plugin_configs(api_config)
 
-                # Check for new devices
+                # Update config version hash
+                config_version = api_config.get("config_version")
+                if config_version and config_version != self._current_config_version:
+                    self._current_config_version = config_version
+                    if self.heartbeat_manager:
+                        self.heartbeat_manager.set_config_version(config_version)
+                    logger.info("config_version_updated", version=config_version)
+
+                # Get all current device IDs from API
+                api_device_ids: set[str] = set()
+                for plugin_config in plugin_configs:
+                    if plugin_config.enabled:
+                        for device in plugin_config.devices:
+                            api_device_ids.add(device.id)
+
+                # Find removed devices
+                removed_device_ids = self._known_device_ids - api_device_ids
+                if removed_device_ids:
+                    for device_id in removed_device_ids:
+                        self._known_device_ids.discard(device_id)
+                        self.scheduler.unschedule_device(device_id)
+                        logger.info("device_removed", device_id=device_id)
+
+                # Find new devices
                 new_devices_found = False
                 for plugin_config in plugin_configs:
                     if not plugin_config.enabled:
@@ -187,16 +229,52 @@ class Collector:
                             )
                             self.scheduler.schedule_plugin(plugin, new_device_config)
 
-                if new_devices_found:
+                if new_devices_found or removed_device_ids:
                     logger.info(
                         "config_refreshed",
                         total_devices=len(self._known_device_ids),
+                        added=len(api_device_ids - self._known_device_ids) if new_devices_found else 0,
+                        removed=len(removed_device_ids),
                     )
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning("config_refresh_error", error=str(e))
+                if self.heartbeat_manager:
+                    self.heartbeat_manager.increment_errors()
+
+    async def _monitor_role(self) -> None:
+        """Monitor role changes and start/stop scheduler accordingly.
+
+        This task runs continuously checking if the collector's role has changed
+        (e.g., promoted from backup to primary) and adjusts the scheduler.
+        """
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
+
+                if not self.heartbeat_manager:
+                    continue
+
+                should_collect = self.heartbeat_manager.should_collect
+
+                if should_collect and not self._scheduler_running:
+                    # Need to start collecting
+                    logger.info("starting_scheduler", role=self.heartbeat_manager.role)
+                    self.scheduler.start()
+                    self._scheduler_running = True
+
+                elif not should_collect and self._scheduler_running:
+                    # Need to stop collecting (demoted to backup)
+                    logger.info("stopping_scheduler", role=self.heartbeat_manager.role)
+                    self.scheduler.stop()
+                    self._scheduler_running = False
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("role_monitor_error", error=str(e))
 
     async def start(self) -> None:
         """Start the collector."""
@@ -222,19 +300,51 @@ class Collector:
             self.db_loader = DatabaseConfigLoader(self.config)
             await self.db_loader.start()
 
+            # Start heartbeat manager for enterprise features
+            self.heartbeat_manager = HeartbeatManager(self.config)
+            await self.heartbeat_manager.start()
+
+            # Start remote log handler
+            self.remote_log_handler = RemoteLogHandler(self.config)
+            await self.remote_log_handler.start()
+
+            # Send initial heartbeat and get role assignment
+            try:
+                heartbeat_response = await self.heartbeat_manager.send_immediate()
+                should_collect = heartbeat_response.get("should_collect", True)
+            except Exception as e:
+                logger.warning("initial_heartbeat_failed", error=str(e))
+                should_collect = True  # Assume primary if can't reach server
+
             try:
                 api_config = await self.db_loader.fetch_config()
                 plugin_configs = self.db_loader.build_plugin_configs(api_config)
+
+                # Store config version
+                self._current_config_version = api_config.get("config_version")
+                if self._current_config_version and self.heartbeat_manager:
+                    self.heartbeat_manager.set_config_version(self._current_config_version)
+
                 await self._load_plugins_from_config(plugin_configs)
             except Exception as e:
                 logger.error("failed_to_fetch_db_config", error=str(e))
                 raise
+
+            # Start scheduler only if we should collect (primary or HA disabled)
+            if should_collect:
+                self.scheduler.start()
+                self._scheduler_running = True
+            else:
+                logger.info("backup_mode_standby", role=self.heartbeat_manager.role)
+
+            # Start role monitor task for HA
+            self._role_monitor_task = asyncio.create_task(self._monitor_role())
+
         else:
             # Config file mode: use plugins from config
             await self._load_plugins_from_config(self.config.plugins)
-
-        # Start scheduler
-        self.scheduler.start()
+            self.scheduler.start()
+            self._scheduler_running = True
 
         # Start config refresh task (database mode only)
         if self.use_database:
@@ -248,6 +358,7 @@ class Collector:
             "collector_started",
             scheduled_devices=self.scheduler.get_scheduled_devices(),
             syslog_enabled=self.config.syslog.enabled,
+            scheduler_running=self._scheduler_running,
         )
 
     async def _start_syslog_server(self) -> None:
@@ -339,6 +450,14 @@ class Collector:
             except asyncio.CancelledError:
                 pass
 
+        # Cancel role monitor task
+        if self._role_monitor_task:
+            self._role_monitor_task.cancel()
+            try:
+                await self._role_monitor_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel syslog source refresh task
         if self._syslog_source_refresh_task:
             self._syslog_source_refresh_task.cancel()
@@ -356,6 +475,12 @@ class Collector:
         # Stop SNMP trap receiver
         if self.snmp_trap_receiver:
             await self.snmp_trap_receiver.stop()
+
+        # Stop enterprise components
+        if self.remote_log_handler:
+            await self.remote_log_handler.stop()
+        if self.heartbeat_manager:
+            await self.heartbeat_manager.stop()
 
         self.scheduler.stop()
         await self.transport.stop()
