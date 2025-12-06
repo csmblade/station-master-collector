@@ -15,6 +15,8 @@ logger = structlog.get_logger(__name__)
 class DatabaseConfigLoader:
     """Loads device configuration from the Station Master API."""
 
+    FETCH_TIMEOUT = 30.0  # seconds - max time for config fetch
+
     def __init__(self, config: "CollectorConfig") -> None:
         """Initialize the database config loader.
 
@@ -57,7 +59,7 @@ class DatabaseConfigLoader:
         logger.info("db_config_loader_stopped")
 
     async def fetch_config(self) -> dict[str, Any]:
-        """Fetch device configuration from the API.
+        """Fetch device configuration from the API with timeout.
 
         Returns:
             Dictionary with station_id, station_name, and devices list
@@ -66,7 +68,11 @@ class DatabaseConfigLoader:
             raise RuntimeError("Config loader not started")
 
         try:
-            response = await self._client.get("/api/v1/collector/config")
+            # Wrap HTTP request with timeout
+            response = await asyncio.wait_for(
+                self._client.get("/api/v1/collector/config"),
+                timeout=self.FETCH_TIMEOUT,
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -78,6 +84,12 @@ class DatabaseConfigLoader:
 
             return data
 
+        except asyncio.TimeoutError:
+            logger.error(
+                "config_fetch_timeout",
+                timeout_seconds=self.FETCH_TIMEOUT,
+            )
+            raise
         except httpx.HTTPStatusError as e:
             logger.error(
                 "config_fetch_http_error",

@@ -2,8 +2,9 @@
 
 import asyncio
 import signal
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Coroutine
 
 import structlog
 import typer
@@ -68,6 +69,14 @@ class Collector:
         # SNMP trap receiver
         self.snmp_trap_receiver: SNMPTrapReceiver | None = None
 
+        # Reliability: watchdog and task monitoring
+        self._running: bool = False
+        self._last_activity: float = time.time()
+        self._watchdog_task: asyncio.Task | None = None
+        self._monitored_tasks: list[asyncio.Task] = []
+        self._health_file = Path("/tmp/collector_heartbeat")
+        self._unhealthy_file = Path("/tmp/collector_unhealthy")
+
     def _on_metrics(self, metrics: list[MetricPoint]) -> None:
         """Callback when metrics are collected."""
         asyncio.create_task(self.transport.enqueue(metrics))
@@ -75,6 +84,9 @@ class Collector:
         # Update heartbeat metrics counter
         if self.heartbeat_manager:
             self.heartbeat_manager.increment_metrics(len(metrics))
+
+        # Touch health file to indicate activity
+        self._touch_health_file()
 
     def _on_syslog_message(
         self, message: SyslogMessage, source_ip: str, protocol: str
@@ -91,6 +103,113 @@ class Collector:
         asyncio.create_task(
             self.syslog_transport.enqueue(message, source_ip, source_id, protocol)
         )
+
+    def _touch_health_file(self) -> None:
+        """Touch the health file to indicate the collector is active."""
+        try:
+            self._health_file.touch()
+            self._last_activity = time.time()
+            # Remove unhealthy marker if present
+            if self._unhealthy_file.exists():
+                self._unhealthy_file.unlink()
+        except Exception:
+            pass  # Ignore file system errors
+
+    def _create_monitored_task(
+        self, coro: Coroutine[Any, Any, Any], name: str
+    ) -> asyncio.Task:
+        """Create a task with exception logging and monitoring."""
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(self._task_done_callback)
+        self._monitored_tasks.append(task)
+        return task
+
+    def _task_done_callback(self, task: asyncio.Task) -> None:
+        """Handle completed/failed background tasks."""
+        # Remove from monitored list
+        if task in self._monitored_tasks:
+            self._monitored_tasks.remove(task)
+
+        if task.cancelled():
+            logger.debug("task_cancelled", task=task.get_name())
+            return
+
+        exc = task.exception()
+        if exc:
+            logger.error(
+                "background_task_failed",
+                task=task.get_name(),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            # Mark as unhealthy
+            try:
+                self._unhealthy_file.touch()
+            except Exception:
+                pass
+
+    async def _watchdog(self) -> None:
+        """Watchdog task that checks for activity and marks unhealthy if frozen."""
+        WATCHDOG_INTERVAL = 60  # Check every 60 seconds
+        ACTIVITY_TIMEOUT = 300  # 5 minutes without activity = unhealthy
+
+        while self._running:
+            try:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+
+                elapsed = time.time() - self._last_activity
+                if elapsed > ACTIVITY_TIMEOUT:
+                    logger.critical(
+                        "watchdog_timeout",
+                        last_activity_seconds_ago=elapsed,
+                        timeout_threshold=ACTIVITY_TIMEOUT,
+                    )
+                    try:
+                        self._unhealthy_file.touch()
+                    except Exception:
+                        pass
+                else:
+                    logger.debug(
+                        "watchdog_ok",
+                        last_activity_seconds_ago=int(elapsed),
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("watchdog_error", error=str(e))
+
+    def health_check(self) -> dict:
+        """Return health status for external health checks."""
+        now = time.time()
+        activity_age = now - self._last_activity
+
+        # Check if heartbeat is healthy
+        heartbeat_ok = True
+        if self.heartbeat_manager:
+            heartbeat_ok = self.heartbeat_manager.is_healthy()
+
+        # Check if scheduler is healthy
+        scheduler_ok = True
+        if hasattr(self.scheduler, 'is_healthy'):
+            scheduler_ok = self.scheduler.is_healthy()
+
+        healthy = (
+            self._running
+            and activity_age < 120  # Activity within last 2 minutes
+            and heartbeat_ok
+            and scheduler_ok
+            and not self._unhealthy_file.exists()
+        )
+
+        return {
+            "healthy": healthy,
+            "running": self._running,
+            "last_activity_seconds_ago": int(activity_age),
+            "heartbeat_ok": heartbeat_ok,
+            "scheduler_ok": scheduler_ok,
+            "monitored_tasks": len(self._monitored_tasks),
+        }
 
     async def _refresh_syslog_sources(self) -> None:
         """Periodically refresh allowed syslog sources from API."""
@@ -278,6 +397,16 @@ class Collector:
 
     async def start(self) -> None:
         """Start the collector."""
+        self._running = True
+        self._last_activity = time.time()
+
+        # Clean up any stale health files from previous runs
+        try:
+            if self._unhealthy_file.exists():
+                self._unhealthy_file.unlink()
+        except Exception:
+            pass
+
         logger.info(
             "collector_starting",
             station_id=self.config.station_id,
@@ -338,7 +467,9 @@ class Collector:
                 logger.info("backup_mode_standby", role=self.heartbeat_manager.role)
 
             # Start role monitor task for HA
-            self._role_monitor_task = asyncio.create_task(self._monitor_role())
+            self._role_monitor_task = self._create_monitored_task(
+                self._monitor_role(), "role_monitor"
+            )
 
         else:
             # Config file mode: use plugins from config
@@ -348,11 +479,21 @@ class Collector:
 
         # Start config refresh task (database mode only)
         if self.use_database:
-            self._config_refresh_task = asyncio.create_task(self._refresh_config())
+            self._config_refresh_task = self._create_monitored_task(
+                self._refresh_config(), "config_refresh"
+            )
 
         # Start syslog server if enabled
         if self.config.syslog.enabled:
             await self._start_syslog_server()
+
+        # Start watchdog task
+        self._watchdog_task = self._create_monitored_task(
+            self._watchdog(), "watchdog"
+        )
+
+        # Touch health file to indicate successful startup
+        self._touch_health_file()
 
         logger.info(
             "collector_started",
@@ -394,8 +535,8 @@ class Collector:
         await self.syslog_server.start()
 
         # Start source refresh task
-        self._syslog_source_refresh_task = asyncio.create_task(
-            self._refresh_syslog_sources()
+        self._syslog_source_refresh_task = self._create_monitored_task(
+            self._refresh_syslog_sources(), "syslog_source_refresh"
         )
 
         logger.info(
@@ -441,6 +582,15 @@ class Collector:
     async def stop(self) -> None:
         """Stop the collector gracefully."""
         logger.info("collector_stopping")
+        self._running = False
+
+        # Cancel watchdog task
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
 
         # Cancel config refresh task
         if self._config_refresh_task:

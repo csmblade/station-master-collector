@@ -3,6 +3,7 @@
 import asyncio
 import gzip
 import json
+import ssl
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,9 @@ logger = structlog.get_logger(__name__)
 class SecureTransport:
     """Handles encrypted transmission of metrics to the central server."""
 
+    SEND_TIMEOUT = 60.0  # seconds - max time for a single send operation
+    FLUSH_TIMEOUT = 120.0  # seconds - max time for complete flush operation
+
     def __init__(self, config: "CollectorConfig") -> None:
         """Initialize the transport layer.
 
@@ -44,7 +48,15 @@ class SecureTransport:
 
     async def start(self) -> None:
         """Initialize transport and start background flushing."""
-        # Initialize HTTP client
+        # Validate security settings
+        security_warnings = self._config.validate_security()
+        for warning in security_warnings:
+            logger.warning(warning)
+
+        # Build SSL context
+        ssl_context = self._build_ssl_context()
+
+        # Initialize HTTP client with TLS settings
         self._client = httpx.AsyncClient(
             base_url=self._config.server_url,
             headers={
@@ -53,6 +65,7 @@ class SecureTransport:
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(30.0, connect=10.0),
+            verify=ssl_context if ssl_context else self._config.tls.verify_ssl,
         )
 
         # Initialize local buffer database
@@ -61,7 +74,53 @@ class SecureTransport:
         # Start background flush task
         self._running = True
         self._flush_task = asyncio.create_task(self._periodic_flush())
-        logger.info("transport_started", server=self._config.server_url)
+        logger.info(
+            "transport_started",
+            server=self._config.server_url,
+            tls_verify=self._config.tls.verify_ssl,
+            environment=self._config.environment,
+        )
+
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """Build SSL context from TLS configuration.
+
+        Returns:
+            SSL context or None if using default verification
+        """
+        tls = self._config.tls
+
+        # If not verifying SSL, return None (httpx will handle it)
+        if not tls.verify_ssl:
+            return None
+
+        # If no custom CA or client certs, use default behavior
+        if not tls.ca_bundle_path and not tls.client_cert_path:
+            return None
+
+        # Build custom SSL context
+        ssl_context = ssl.create_default_context()
+
+        # Set minimum TLS version
+        if tls.min_tls_version == "1.3":
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
+        else:
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        # Load custom CA bundle
+        if tls.ca_bundle_path and tls.ca_bundle_path.exists():
+            ssl_context.load_verify_locations(cafile=str(tls.ca_bundle_path))
+            logger.debug("loaded_custom_ca_bundle", path=str(tls.ca_bundle_path))
+
+        # Load client certificate for mTLS
+        if tls.client_cert_path and tls.client_key_path:
+            if tls.client_cert_path.exists() and tls.client_key_path.exists():
+                ssl_context.load_cert_chain(
+                    certfile=str(tls.client_cert_path),
+                    keyfile=str(tls.client_key_path),
+                )
+                logger.debug("loaded_client_certificate", cert=str(tls.client_cert_path))
+
+        return ssl_context
 
     async def stop(self) -> None:
         """Stop transport and flush remaining metrics."""
@@ -148,11 +207,19 @@ class SecureTransport:
 
     async def flush(self) -> None:
         """Immediately flush all buffered metrics."""
-        async with self._buffer_lock:
-            await self._flush_buffer()
+        try:
+            # Use a timeout for the entire flush operation
+            async with asyncio.timeout(self.FLUSH_TIMEOUT):
+                async with self._buffer_lock:
+                    await self._flush_buffer()
 
-        # Also try to send any persisted metrics
-        await self._flush_persisted()
+                # Also try to send any persisted metrics
+                await self._flush_persisted()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "flush_operation_timeout",
+                timeout_seconds=self.FLUSH_TIMEOUT,
+            )
 
     async def _periodic_flush(self) -> None:
         """Background task for periodic flushing."""
@@ -176,8 +243,19 @@ class SecureTransport:
         payload = self._prepare_payload(batches)
 
         try:
-            await self._send_with_retry(payload)
+            # Wrap send operation with timeout to prevent hanging
+            await asyncio.wait_for(
+                self._send_with_retry(payload),
+                timeout=self.SEND_TIMEOUT,
+            )
             logger.debug("buffer_flushed", batch_count=len(batches))
+        except asyncio.TimeoutError:
+            logger.warning(
+                "flush_timeout_persisting",
+                timeout_seconds=self.SEND_TIMEOUT,
+                batch_count=len(batches),
+            )
+            await self._persist_to_disk(payload)
         except Exception as e:
             logger.warning("flush_failed_persisting", error=str(e))
             await self._persist_to_disk(payload)

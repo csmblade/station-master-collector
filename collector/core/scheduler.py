@@ -1,6 +1,7 @@
 """Collection scheduling for metrics gathering."""
 
 import asyncio
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -18,6 +19,9 @@ logger = structlog.get_logger(__name__)
 
 class CollectionScheduler:
     """Manages scheduled metric collection from devices."""
+
+    COLLECTION_TIMEOUT = 120.0  # seconds - max time for a single device collection
+    HEALTH_THRESHOLD = 300  # seconds - max time since last collection for healthy status
 
     def __init__(
         self,
@@ -37,6 +41,11 @@ class CollectionScheduler:
         self._max_concurrent = max_concurrent_devices
         self._collection_semaphore: asyncio.Semaphore | None = None
 
+        # Health tracking
+        self._last_collection_time: float = 0.0
+        self._last_successful_collection: float = 0.0
+        self._consecutive_failures: int = 0
+
     def start(self) -> None:
         """Start the scheduler."""
         if not self._running:
@@ -54,6 +63,28 @@ class CollectionScheduler:
             self._scheduler.shutdown(wait=True)
             self._running = False
             logger.info("scheduler_stopped")
+
+    def is_healthy(self) -> bool:
+        """Check if scheduler is healthy.
+
+        Returns:
+            True if scheduler is running and collecting successfully
+        """
+        # If no devices scheduled, consider healthy
+        if not self._collection_tasks:
+            return True
+
+        # If scheduler not running, not healthy
+        if not self._running:
+            return False
+
+        # If never collected successfully, healthy if just started
+        if self._last_successful_collection == 0.0:
+            return True
+
+        # Check if last successful collection was within threshold
+        elapsed = time.time() - self._last_successful_collection
+        return elapsed < self.HEALTH_THRESHOLD and self._consecutive_failures < 5
 
     def schedule_plugin(
         self,
@@ -176,7 +207,7 @@ class CollectionScheduler:
         plugin: "BasePlugin",
         device_config: "DeviceConfig",
     ) -> None:
-        """Actually perform the metric collection.
+        """Actually perform the metric collection with timeout.
 
         Args:
             plugin: Plugin instance
@@ -184,6 +215,7 @@ class CollectionScheduler:
         """
         device_id = device_config.id
         start_time = datetime.utcnow()
+        self._last_collection_time = time.time()
 
         try:
             logger.debug(
@@ -192,12 +224,15 @@ class CollectionScheduler:
                 plugin=plugin.plugin_name,
             )
 
-            # Collect metrics from the device
+            # Collect metrics from the device with timeout
             # Serialize config, exposing SecretStr values for SNMP/HTTP auth
             device_dict = self._serialize_config(device_config)
-            metrics = await plugin.collect(
-                device=device_dict,
-                config=device_dict,
+            metrics = await asyncio.wait_for(
+                plugin.collect(
+                    device=device_dict,
+                    config=device_dict,
+                ),
+                timeout=self.COLLECTION_TIMEOUT,
             )
 
             elapsed = (datetime.utcnow() - start_time).total_seconds()
@@ -210,20 +245,37 @@ class CollectionScheduler:
                 elapsed_seconds=elapsed,
             )
 
+            # Mark successful collection
+            self._last_successful_collection = time.time()
+            self._consecutive_failures = 0
+
             # Send metrics to callback
             if self._on_metrics_collected and metrics:
                 self._on_metrics_collected(metrics)
 
+        except asyncio.TimeoutError:
+            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            self._consecutive_failures += 1
+            logger.error(
+                "collection_timeout",
+                device_id=device_id,
+                plugin=plugin.plugin_name,
+                timeout_seconds=self.COLLECTION_TIMEOUT,
+                elapsed_seconds=elapsed,
+                consecutive_failures=self._consecutive_failures,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
             elapsed = (datetime.utcnow() - start_time).total_seconds()
+            self._consecutive_failures += 1
             logger.error(
                 "collection_failed",
                 device_id=device_id,
                 plugin=plugin.plugin_name,
                 error=str(e),
                 elapsed_seconds=elapsed,
+                consecutive_failures=self._consecutive_failures,
             )
 
     async def collect_now(

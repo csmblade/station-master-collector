@@ -1,9 +1,9 @@
 """Heartbeat manager for collector health reporting."""
 
 import asyncio
-import platform
+import ssl
 import socket
-from datetime import datetime
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -23,6 +23,8 @@ class HeartbeatManager:
     """
 
     HEARTBEAT_INTERVAL = 30  # seconds
+    HEARTBEAT_TIMEOUT = 30.0  # seconds - timeout for single heartbeat
+    HEALTH_THRESHOLD = 90  # seconds - max age of last successful heartbeat
 
     def __init__(self, config: "CollectorConfig") -> None:
         """Initialize the heartbeat manager.
@@ -46,6 +48,10 @@ class HeartbeatManager:
         # Metrics counters (updated by main collector)
         self._metrics_collected: int = 0
         self._error_count: int = 0
+
+        # Health tracking
+        self._last_successful_heartbeat: float = 0.0
+        self._consecutive_failures: int = 0
 
     @property
     def collector_id(self) -> str | None:
@@ -91,8 +97,24 @@ class HeartbeatManager:
         """
         self._error_count += count
 
+    def is_healthy(self) -> bool:
+        """Check if heartbeat is healthy.
+
+        Returns:
+            True if last successful heartbeat was within threshold
+        """
+        if self._last_successful_heartbeat == 0.0:
+            # No successful heartbeat yet - healthy if just started
+            return True
+
+        elapsed = time.time() - self._last_successful_heartbeat
+        return elapsed < self.HEALTH_THRESHOLD and self._consecutive_failures < 3
+
     async def start(self) -> None:
         """Start the heartbeat manager."""
+        # Build SSL context from TLS config
+        ssl_context = self._build_ssl_context()
+
         self._client = httpx.AsyncClient(
             base_url=self._config.server_url,
             headers={
@@ -101,11 +123,51 @@ class HeartbeatManager:
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(30.0, connect=10.0),
+            verify=ssl_context if ssl_context else self._config.tls.verify_ssl,
         )
 
         self._running = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("heartbeat_manager_started", hostname=self._hostname)
+
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """Build SSL context from TLS configuration.
+
+        Returns:
+            SSL context or None if using default verification
+        """
+        tls = self._config.tls
+
+        # If not verifying SSL, return None (httpx will handle it)
+        if not tls.verify_ssl:
+            return None
+
+        # If no custom CA or client certs, use default behavior
+        if not tls.ca_bundle_path and not tls.client_cert_path:
+            return None
+
+        # Build custom SSL context
+        ssl_context = ssl.create_default_context()
+
+        # Set minimum TLS version
+        if tls.min_tls_version == "1.3":
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
+        else:
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        # Load custom CA bundle
+        if tls.ca_bundle_path and tls.ca_bundle_path.exists():
+            ssl_context.load_verify_locations(cafile=str(tls.ca_bundle_path))
+
+        # Load client certificate for mTLS
+        if tls.client_cert_path and tls.client_key_path:
+            if tls.client_cert_path.exists() and tls.client_key_path.exists():
+                ssl_context.load_cert_chain(
+                    certfile=str(tls.client_cert_path),
+                    keyfile=str(tls.client_key_path),
+                )
+
+        return ssl_context
 
     async def stop(self) -> None:
         """Stop the heartbeat manager."""
@@ -140,7 +202,7 @@ class HeartbeatManager:
                 await asyncio.sleep(5)
 
     async def _send_heartbeat(self) -> None:
-        """Send a single heartbeat to the server."""
+        """Send a single heartbeat to the server with timeout."""
         if not self._client:
             return
 
@@ -159,9 +221,13 @@ class HeartbeatManager:
         }
 
         try:
-            response = await self._client.post(
-                "/api/v1/collector/heartbeat",
-                json=payload,
+            # Wrap HTTP request with timeout
+            response = await asyncio.wait_for(
+                self._client.post(
+                    "/api/v1/collector/heartbeat",
+                    json=payload,
+                ),
+                timeout=self.HEARTBEAT_TIMEOUT,
             )
             response.raise_for_status()
 
@@ -173,6 +239,10 @@ class HeartbeatManager:
             self._role = data.get("role", "primary")
             self._should_collect = data.get("should_collect", True)
             self._config_changed = data.get("config_changed", False)
+
+            # Mark successful heartbeat
+            self._last_successful_heartbeat = time.time()
+            self._consecutive_failures = 0
 
             # Log role changes
             if previous_role != self._role:
@@ -193,14 +263,28 @@ class HeartbeatManager:
                 should_collect=self._should_collect,
             )
 
+        except asyncio.TimeoutError:
+            self._consecutive_failures += 1
+            logger.warning(
+                "heartbeat_timeout",
+                timeout_seconds=self.HEARTBEAT_TIMEOUT,
+                consecutive_failures=self._consecutive_failures,
+            )
         except httpx.HTTPStatusError as e:
+            self._consecutive_failures += 1
             logger.warning(
                 "heartbeat_failed",
                 status_code=e.response.status_code,
                 error=str(e),
+                consecutive_failures=self._consecutive_failures,
             )
         except Exception as e:
-            logger.warning("heartbeat_error", error=str(e))
+            self._consecutive_failures += 1
+            logger.warning(
+                "heartbeat_error",
+                error=str(e),
+                consecutive_failures=self._consecutive_failures,
+            )
 
     def _get_system_metrics(self) -> tuple[float | None, float | None]:
         """Get current system memory and CPU usage.
@@ -272,9 +356,13 @@ class HeartbeatManager:
             "collector_version": self._get_version(),
         }
 
-        response = await self._client.post(
-            "/api/v1/collector/heartbeat",
-            json=payload,
+        # Wrap HTTP request with timeout
+        response = await asyncio.wait_for(
+            self._client.post(
+                "/api/v1/collector/heartbeat",
+                json=payload,
+            ),
+            timeout=self.HEARTBEAT_TIMEOUT,
         )
         response.raise_for_status()
 
@@ -285,6 +373,10 @@ class HeartbeatManager:
         self._role = data.get("role", "primary")
         self._should_collect = data.get("should_collect", True)
         self._config_changed = data.get("config_changed", False)
+
+        # Mark successful heartbeat
+        self._last_successful_heartbeat = time.time()
+        self._consecutive_failures = 0
 
         logger.info(
             "initial_heartbeat",
