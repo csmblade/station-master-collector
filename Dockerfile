@@ -24,7 +24,7 @@ RUN pip install --upgrade pip build
 
 # Copy project files
 COPY collector/ ./collector/
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 
 # Install dependencies
 RUN pip install --target=/app/deps .
