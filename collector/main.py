@@ -410,7 +410,6 @@ class Collector:
         logger.info(
             "collector_starting",
             station_id=self.config.station_id,
-            station_name=self.config.station_name,
             mode="database" if self.use_database else "config_file",
         )
 
@@ -429,9 +428,25 @@ class Collector:
             self.db_loader = DatabaseConfigLoader(self.config)
             await self.db_loader.start()
 
-            # Start heartbeat manager for enterprise features
+            # Fetch config first to get station name for collector registration
+            try:
+                api_config = await self.db_loader.fetch_config()
+                server_station_name = api_config.get("station_name", "")
+            except Exception as e:
+                logger.error("failed_to_fetch_initial_config", error=str(e))
+                raise
+
+            # Start heartbeat manager with station name from server
             self.heartbeat_manager = HeartbeatManager(self.config)
+            if server_station_name:
+                self.heartbeat_manager.set_hostname_from_station(server_station_name)
             await self.heartbeat_manager.start()
+
+            logger.info(
+                "collector_identity",
+                hostname=self.heartbeat_manager.hostname,
+                station_name=server_station_name,
+            )
 
             # Start remote log handler
             self.remote_log_handler = RemoteLogHandler(self.config)
@@ -446,13 +461,35 @@ class Collector:
                 should_collect = True  # Assume primary if can't reach server
 
             try:
-                api_config = await self.db_loader.fetch_config()
+                # Build plugin configs from already-fetched api_config
                 plugin_configs = self.db_loader.build_plugin_configs(api_config)
 
                 # Store config version
                 self._current_config_version = api_config.get("config_version")
                 if self._current_config_version and self.heartbeat_manager:
                     self.heartbeat_manager.set_config_version(self._current_config_version)
+
+                # Diagnostic logging: show device summary
+                total_devices = sum(len(pc.devices) for pc in plugin_configs)
+                enabled_devices = sum(
+                    len([d for d in pc.devices if d.enabled])
+                    for pc in plugin_configs
+                )
+                plugin_names = [pc.plugin_name for pc in plugin_configs if pc.enabled]
+
+                if total_devices == 0:
+                    logger.warning(
+                        "no_devices_configured",
+                        station_id=self.config.station_id,
+                        message="No devices returned from server. Check dashboard configuration.",
+                    )
+                else:
+                    logger.info(
+                        "device_config_summary",
+                        total_devices=total_devices,
+                        enabled_devices=enabled_devices,
+                        plugins=plugin_names,
+                    )
 
                 await self._load_plugins_from_config(plugin_configs)
             except Exception as e:
@@ -463,8 +500,18 @@ class Collector:
             if should_collect:
                 self.scheduler.start()
                 self._scheduler_running = True
+                logger.info(
+                    "collection_active",
+                    role=self.heartbeat_manager.role if self.heartbeat_manager else "unknown",
+                    scheduled_devices=len(self._known_device_ids),
+                )
             else:
-                logger.info("backup_mode_standby", role=self.heartbeat_manager.role)
+                logger.warning(
+                    "collection_inactive",
+                    role=self.heartbeat_manager.role if self.heartbeat_manager else "unknown",
+                    reason="backup_role",
+                    message="Collector is in backup mode. It will not collect data until promoted to primary.",
+                )
 
             # Start role monitor task for HA
             self._role_monitor_task = self._create_monitored_task(

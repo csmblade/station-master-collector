@@ -36,7 +36,14 @@ class HeartbeatManager:
         self._client: httpx.AsyncClient | None = None
         self._running = False
         self._heartbeat_task: asyncio.Task | None = None
-        self._hostname = socket.gethostname()
+
+        # Hostname will be set from server's station_name after first config fetch
+        # Use collector_name from config if explicitly set, otherwise temporary socket hostname
+        if config.collector_name:
+            self._hostname = config.collector_name
+        else:
+            # Temporary - will be updated with station name from server
+            self._hostname = socket.gethostname()
 
         # State tracking
         self._collector_id: str | None = None
@@ -52,6 +59,11 @@ class HeartbeatManager:
         # Health tracking
         self._last_successful_heartbeat: float = 0.0
         self._consecutive_failures: int = 0
+
+    @property
+    def hostname(self) -> str:
+        """Get the current hostname used for registration."""
+        return self._hostname
 
     @property
     def collector_id(self) -> str | None:
@@ -80,6 +92,26 @@ class HeartbeatManager:
             version_hash: SHA256 hash of current config (first 16 chars)
         """
         self._config_version_hash = version_hash
+
+    def set_hostname_from_station(self, station_name: str) -> None:
+        """Set hostname based on station name from server.
+
+        This should be called after fetching config from the server,
+        before the first heartbeat is sent. Format: "{station_name} - Collector"
+
+        Args:
+            station_name: Station name from server config
+        """
+        if station_name and not self._config.collector_name:
+            new_hostname = f"{station_name} - Collector"
+            if new_hostname != self._hostname:
+                logger.info(
+                    "hostname_updated_from_server",
+                    old_hostname=self._hostname,
+                    new_hostname=new_hostname,
+                    station_name=station_name,
+                )
+                self._hostname = new_hostname
 
     def increment_metrics(self, count: int = 1) -> None:
         """Increment the metrics collected counter.

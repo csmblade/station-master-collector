@@ -81,6 +81,30 @@ class SyslogConfig(BaseSettings):
     snmp_trap_community: str = "public"
 
 
+class TLSConfig(BaseSettings):
+    """TLS/HTTPS configuration for server communication."""
+
+    # Verify server certificate (should be True in production)
+    verify_ssl: bool = True
+
+    # Path to CA bundle (optional, uses system defaults if not set)
+    ca_bundle_path: Path | None = None
+
+    # Client certificate authentication (mTLS)
+    client_cert_path: Path | None = None
+    client_key_path: Path | None = None
+
+    # Minimum TLS version (1.2 or 1.3)
+    min_tls_version: str = "1.2"
+
+    @field_validator("min_tls_version")
+    @classmethod
+    def validate_tls_version(cls, v: str) -> str:
+        if v not in ("1.2", "1.3"):
+            raise ValueError("min_tls_version must be 1.2 or 1.3")
+        return v
+
+
 class CollectorConfig(BaseSettings):
     """Main collector configuration."""
 
@@ -92,11 +116,21 @@ class CollectorConfig(BaseSettings):
 
     # Station identity
     station_id: str
-    station_name: str = ""
+    station_name: str = ""  # Optional - will be fetched from server
+
+    # Collector identity (optional override)
+    # If empty, auto-generated as "{station_name} - Collector" using name from server
+    collector_name: str = ""
 
     # Server connection
     server_url: str
     api_key: SecretStr
+
+    # TLS settings
+    tls: TLSConfig = Field(default_factory=TLSConfig)
+
+    # Environment mode (affects security defaults)
+    environment: str = "production"
 
     # Plugins (loaded from config file)
     plugins: list[PluginConfig] = Field(default_factory=list)
@@ -126,6 +160,43 @@ class CollectorConfig(BaseSettings):
         if v not in ("none", "gzip", "lz4"):
             raise ValueError("compression must be none, gzip, or lz4")
         return v
+
+    @field_validator("server_url")
+    @classmethod
+    def validate_server_url(cls, v: str) -> str:
+        """Validate server URL format."""
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("server_url must start with http:// or https://")
+        return v.rstrip("/")
+
+    @property
+    def requires_https(self) -> bool:
+        """Check if HTTPS is required based on environment."""
+        return self.environment == "production"
+
+    def validate_security(self) -> list[str]:
+        """Validate security settings and return warnings.
+
+        Returns:
+            List of warning messages (empty if all checks pass)
+        """
+        warnings = []
+
+        # Check HTTPS in production
+        if self.requires_https and not self.server_url.startswith("https://"):
+            warnings.append(
+                "SECURITY WARNING: Using HTTP in production. "
+                "Set server_url to https:// or set environment=development"
+            )
+
+        # Check certificate verification
+        if not self.tls.verify_ssl:
+            warnings.append(
+                "SECURITY WARNING: SSL certificate verification is disabled. "
+                "This exposes you to man-in-the-middle attacks."
+            )
+
+        return warnings
 
     @classmethod
     def from_file(cls, config_path: Path) -> "CollectorConfig":

@@ -118,15 +118,40 @@ class DatabaseConfigLoader:
 
         devices = api_response.get("devices", [])
 
-        # Group devices by plugin
+        # Log raw device count for debugging
+        logger.info("api_devices_received", count=len(devices))
+
+        if not devices:
+            logger.warning(
+                "empty_device_list",
+                message="Server returned no devices. Ensure devices are configured in the dashboard.",
+            )
+            return []
+
+        # Group devices by plugin, tracking skipped devices
         plugins_map: dict[str, list[dict]] = {}
+        skipped_devices: list[dict] = []
+
         for device in devices:
             plugin_name = device.get("plugin", "")
             if not plugin_name:
+                skipped_devices.append({
+                    "id": device.get("id", "unknown"),
+                    "name": device.get("name", "unknown"),
+                    "reason": "no_plugin_specified",
+                })
                 continue
             if plugin_name not in plugins_map:
                 plugins_map[plugin_name] = []
             plugins_map[plugin_name].append(device)
+
+        if skipped_devices:
+            logger.warning(
+                "devices_skipped",
+                count=len(skipped_devices),
+                devices=skipped_devices,
+                message="Some devices were skipped because they have no plugin configured.",
+            )
 
         # Build PluginConfig for each plugin
         plugin_configs = []

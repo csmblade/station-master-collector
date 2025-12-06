@@ -55,8 +55,20 @@ class PluginManager:
                 if plugin_class:
                     discovered[name] = plugin_class
                     logger.info("discovered_builtin_plugin", plugin=name)
+                else:
+                    logger.error(
+                        "plugin_class_not_found",
+                        plugin=name,
+                        module_path=module_path,
+                        message="Module loaded but no BasePlugin subclass found.",
+                    )
             except Exception as e:
-                logger.warning("failed_to_load_builtin_plugin", plugin=name, error=str(e))
+                logger.error(
+                    "failed_to_load_builtin_plugin",
+                    plugin=name,
+                    error=str(e),
+                    message="Plugin failed to load. Devices using this plugin will not be collected.",
+                )
 
         # Load custom plugins
         if self._custom_plugin_path and self._custom_plugin_path.exists():
@@ -68,11 +80,18 @@ class PluginManager:
                             name = plugin_dir.name
                             discovered[name] = plugin_class
                             logger.info("discovered_custom_plugin", plugin=name)
+                        else:
+                            logger.error(
+                                "custom_plugin_class_not_found",
+                                path=str(plugin_dir),
+                                message="Plugin loaded but no BasePlugin subclass found.",
+                            )
                     except Exception as e:
-                        logger.warning(
+                        logger.error(
                             "failed_to_load_custom_plugin",
                             path=str(plugin_dir),
                             error=str(e),
+                            message="Custom plugin failed to load.",
                         )
 
         self._plugins = discovered
